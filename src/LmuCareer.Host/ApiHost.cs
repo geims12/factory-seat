@@ -1,4 +1,5 @@
 using System.IO;
+using System.Net.Http;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using LmuCareer.Core;
@@ -142,6 +143,15 @@ public sealed class ApiHost
         "exportCareer" => ExportCareer(args),
         "importCareer" => ImportCareer(),
         "armRound" => Change(args, c => Arm(StillRacing(c))),
+        "setUpInLmu" => SetUpInLmu(args),
+        "carChoices" => CarChoices(args),
+        "carImage" => CarImage(Str(args, "vehicleId")),
+        "chooseCar" => Change(args, c =>
+        {
+            var season = StillRacing(c).CurrentSeason;
+            CarChoice.Choose(season, season.NextRound ?? throw new PlayerError("There's no race to set up."),
+                new CarEntry(Str(args, "team"), Str(args, "number")), _catalog);
+        }),
         "retireCareer" => RetireCareer(args),
         "hallOfFame" => new { entries = _hall.Entries(), headStarts = HeadStarts.Unlocked(_hall.Entries()) },
         "disarmRound" => Change(args, c => RoundFlow.Disarm(c.CurrentSeason.ArmedRound ?? throw new InvalidOperationException("No round is armed."))),
@@ -379,6 +389,8 @@ public sealed class ApiHost
                 .Where(s => s.Id.StartsWith("own-", StringComparison.Ordinal) && s.Name.Trim().Length > 0)
                 .Select(s => { s.Name = s.Name.Trim(); s.Region = s.Region.Trim(); return s; })
                 .ToList();
+        if (args.TryGetProperty("lmuSessions", out var sessions))
+            _settings.LmuSessions = (JsonSerializer.Deserialize<LmuSessions>(sessions.GetRawText(), Json) ?? LmuSessions.Default).Normalized();
         if (args.TryGetProperty("builtLiveries", out var built))
             _settings.BuiltLiveries = built.EnumerateArray().Select(x => x.GetString() ?? "").Where(x => x.Length > 0).Distinct().ToList();
         _settings.Save();
@@ -747,6 +759,214 @@ public sealed class ApiHost
     {
         var round = RoundFlow.Arm(career.CurrentSeason, DateTimeOffset.Now);
         if (career.IsNewGamePlus && _install is not null) round.AiAtStart = AiProof.Settings(_install.SettingsFile);
+    }
+
+    // A race being set up in LMU, at most one at a time.
+    private bool _settingUpLmu;
+
+    /// <summary>
+    /// Sets the next race up in LMU through its local API and loads it, starting the race weekend
+    /// just before the load. It takes a few seconds, so it runs in the background and reports to
+    /// the page as lmuSetup events: working (with a step), done, or failed (with a phrase).
+    /// </summary>
+    private object SetUpInLmu(JsonElement args)
+    {
+        var career = StillRacing(Load(args));
+        var round = career.CurrentSeason.NextRound ?? throw new PlayerError("There's no race to set up.");
+        if (_settingUpLmu) throw new PlayerError("Factory Seat is already setting a race up in LMU.");
+
+        var briefing = BriefingFile.For(career, _catalog, Updates.CurrentLabel, DateTimeOffset.Now).Round
+            ?? throw new PlayerError("There's no race to set up.");
+        var ev = round.EventId.Length > 0 ? _catalog.Event(round.EventId) : null;
+        var car = briefing.Car.Folder is { Length: > 0 } folder ? _catalog.Car(folder) : null;
+        // Checked here, so what the app can't set up says so at once, before LMU is asked anything.
+        if (round.Test is not null || LmuRaceSetup.Scene(briefing.Track.Folder, briefing.Track.LayoutFile) is null
+            || LmuRaceSetup.Grid(ev, car) is null || briefing.Car.CustomTeam)
+            LmuRaceSetup.Plan(briefing, ev, car, []);
+
+        _settingUpLmu = true;
+        var id = career.Id;
+        var sessions = _settings.LmuSessions;
+        _ = Task.Run(() => RunLmuSetup(id, briefing, ev, car, sessions));
+        return new { started = true };
+    }
+
+    private async Task RunLmuSetup(Guid id, BriefingRound briefing, EventInfo? ev, CarInfo? car, LmuSessions sessions)
+    {
+        void Post(string status, string? step = null, Phrase? error = null) =>
+            _window.Invoke(() => _window.PostEvent(JsonSerializer.Serialize(
+                new { @event = "lmuSetup", careerId = id, status, step, error = error?.ToString(), phrase = error }, Json)));
+
+        using var cancel = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        using var game = new LmuGame();
+        try
+        {
+            Post("working", "connect");
+            var state = await game.StateAsync(cancel.Token)
+                ?? throw new PlayerError("LMU isn't running. Start it, go to its main menu, and try again.");
+            if (state.Navigation is not ("NAV_MAIN_MENU" or "NAV_SETUP"))
+                throw new PlayerError("LMU is in a session. Leave it, go to LMU's main menu, and try again.");
+
+            var vehicles = await game.VehiclesAsync(cancel.Token);
+            _window.Invoke(() => KeepVehicles(vehicles));
+            var plan = LmuRaceSetup.Plan(briefing, ev, car, vehicles, sessions);
+            var track = (await game.TracksAsync(cancel.Token)).FirstOrDefault(t => t.SceneDesc == plan.SceneDesc)
+                ?? throw new PlayerError("LMU's track list has no {layout}. Set this race up in LMU yourself.", ("layout", briefing.Track.LayoutName));
+
+            await game.SetUpAsync(plan, track, () => ArmFromLmu(id), step => Post("working", step), cancel.Token);
+            Post("done");
+        }
+        catch (PlayerError ex)
+        {
+            Post("failed", error: ex.Phrase);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or LmuApiException or IOException)
+        {
+            Log($"LMU setup: {ex.Message}");
+            Post("failed", error: Phrase.Of("LMU stopped answering while Factory Seat set the race up. Check the game, then try again."));
+        }
+        catch (Exception ex)
+        {
+            Log($"LMU setup error: {ex}");
+            Post("failed", error: Phrase.Of("Setting the race up in LMU went wrong. Set it up in LMU yourself; the error is in page-errors.log."));
+        }
+        finally
+        {
+            _window.Invoke(() => _settingUpLmu = false);
+        }
+    }
+
+    // LMU's car list, kept from the last time LMU answered, so the car picker can show each
+    // entry's livery with the game closed. Refreshed in the background once per run of the app.
+    private IReadOnlyList<LmuVehicle>? _lmuVehicles;
+    private bool _lmuVehiclesFresh;
+    private bool _lmuVehiclesAsking;
+    private DateTime _lmuVehiclesAskedAt;
+    private static string LmuVehiclesFile => Path.Combine(CareerStore.DefaultRoot, "lmu-vehicles.json");
+
+    /// <summary>
+    /// The entries the player can race as in the next round, before the season's first race (empty
+    /// after), each with the LMU entry whose livery the race would use, when LMU's list has it.
+    /// </summary>
+    private object CarChoices(JsonElement args)
+    {
+        var season = Load(args).CurrentSeason;
+        if (season.NextRound is not { } round) return Array.Empty<object>();
+        var entries = CarChoice.For(season, round, _catalog);
+        if (entries.Count == 0) return Array.Empty<object>();
+
+        RefreshLmuVehicles();
+        var vehicles = LmuVehicles();
+        var car = season.CarFor(round);
+        var folder = car.Folder.Length > 0 ? car.Folder : _catalog.CarByType(car.CarType)?.Folder ?? "";
+        var ev = round.EventId.Length > 0 ? _catalog.Event(round.EventId) : null;
+        var info = folder.Length > 0 ? _catalog.Car(folder) : null;
+        return entries.Select(e =>
+        {
+            var livery = vehicles.Count > 0 ? LmuRaceSetup.Livery(round.TrackFolder, ev, info, folder, e, vehicles) : null;
+            return new { e.Team, e.Number, vehicleId = livery?.Id, livery = livery?.Description };
+        }).ToList();
+    }
+
+    /// <summary>An entry's picture from LMU's menus, as a data URL for an img; null when there's none.</summary>
+    private object? CarImage(string vehicleId) =>
+        _install is not null && LmuCarImages.FrontAngle(_install.Root, vehicleId) is { } webp
+            ? "data:image/webp;base64," + Convert.ToBase64String(webp)
+            : null;
+
+    private IReadOnlyList<LmuVehicle> LmuVehicles()
+    {
+        if (_lmuVehicles is not null) return _lmuVehicles;
+        try
+        {
+            _lmuVehicles = File.Exists(LmuVehiclesFile)
+                ? JsonSerializer.Deserialize<List<LmuVehicle>>(File.ReadAllText(LmuVehiclesFile), Json) ?? []
+                : [];
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            _lmuVehicles = [];
+        }
+        return _lmuVehicles;
+    }
+
+    /// <summary>Keeps LMU's car list, in memory and next to the saves; on the window's thread.</summary>
+    private void KeepVehicles(IReadOnlyList<LmuVehicle> vehicles)
+    {
+        if (vehicles.Count == 0) return;
+        _lmuVehicles = vehicles;
+        try
+        {
+            File.WriteAllText(LmuVehiclesFile, JsonSerializer.Serialize(vehicles, Json));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Log($"lmu-vehicles.json not written: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Asks a running LMU for its car list and tells the page when it comes (an lmuVehicles event)
+    /// so the car picker can show the liveries. Once it has answered, not again this run of the app;
+    /// until then, each time the picker opens, at most every 10 seconds. Quietly does nothing when
+    /// LMU isn't running.
+    /// </summary>
+    private void RefreshLmuVehicles()
+    {
+        if (_lmuVehiclesFresh || _lmuVehiclesAsking || DateTime.UtcNow - _lmuVehiclesAskedAt < TimeSpan.FromSeconds(10)) return;
+        _lmuVehiclesAsking = true;
+        _lmuVehiclesAskedAt = DateTime.UtcNow;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var cancel = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+                using var game = new LmuGame();
+                if (await game.StateAsync(cancel.Token) is null) return;
+                var vehicles = await game.VehiclesAsync(cancel.Token);
+                if (vehicles.Count == 0) return;
+                _window.Invoke(() =>
+                {
+                    KeepVehicles(vehicles);
+                    _lmuVehiclesFresh = true;
+                    _window.PostEvent(JsonSerializer.Serialize(new { @event = "lmuVehicles" }, Json));
+                });
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or LmuApiException)
+            {
+                // LMU closed or busy: the kept list (if any) stays, and the next look asks again.
+            }
+            finally
+            {
+                _window.Invoke(() => _lmuVehiclesAsking = false);
+            }
+        });
+    }
+
+    /// <summary>Starts the race weekend on the window's thread, unless it's already started.</summary>
+    private Task ArmFromLmu(Guid id)
+    {
+        var armed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _window.Invoke(() =>
+        {
+            try
+            {
+                var career = StillRacing(_store.Load(id).Career);
+                if (career.CurrentSeason.ArmedRound is null)
+                {
+                    Arm(career);
+                    career.LastPlayedAt = DateTimeOffset.Now;
+                    _store.Save(career);
+                    WriteBriefing(career);
+                }
+                armed.SetResult();
+            }
+            catch (Exception ex)
+            {
+                armed.SetException(ex);
+            }
+        });
+        return armed.Task;
     }
 
     /// <summary>A retired career keeps its records but races no more.</summary>
