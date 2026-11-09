@@ -483,3 +483,6 @@ $RECYCLE.BIN/
 
 # Release builds
 publish/
+
+# LMU API probe dumps (hold the in-game driver name)
+lmu-probe/
