@@ -44,9 +44,6 @@ public sealed class AppSettings
     /// <summary>Sponsors whose livery the player has built, by sponsor id: those sponsors call more often.</summary>
     public List<string> BuiltLiveries { get; set; } = [];
 
-    /// <summary>Practice and qualifying for races Factory Seat sets up in LMU.</summary>
-    public LmuSessions LmuSessions { get; set; } = LmuSessions.Default;
-
     /// <summary>Brands the player added themselves, for liveries of their own design.</summary>
     public List<OwnSponsor> CustomSponsors { get; set; } = [];
 

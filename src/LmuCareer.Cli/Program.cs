@@ -10,7 +10,6 @@ using static LmuCareer.Cli.Format;
 //   season <race.xml[@weight]> ...            score races as rounds of one championship
 //   debrief <race.xml>                        what a counted race stores for the debrief (1.2)
 //   career ...                                career saves; see CareerCommands.cs
-//   lmu ...                                   read-only probe of LMU's local REST API; see LmuProbe.cs
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
@@ -21,7 +20,6 @@ return args switch
     ["season", .. var files] when files.Length > 0 => Season(files),
     ["debrief", var file] => Debrief(file),
     ["career", .. var rest] => CareerCommands.Run(rest),
-    ["lmu", .. var rest] => LmuProbe.Run(rest),
     ["content"] => ContentCommands.Check(null),
     ["content", var root] => ContentCommands.Check(root),
     _ => Usage(),
@@ -33,7 +31,6 @@ static int Usage()
     Console.WriteLine("       lmucareer season <race.xml[@weight]> [<race.xml[@weight]> ...]");
     Console.WriteLine("       lmucareer debrief <race.xml>");
     Console.WriteLine("       lmucareer career help");
-    Console.WriteLine("       lmucareer lmu state|dump|diff");
     return 1;
 }
 

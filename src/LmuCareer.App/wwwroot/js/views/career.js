@@ -29,18 +29,6 @@ let openMessage = null;
 // The Race weekend panel's results area on the briefing, for news found when the career opens.
 let weekendResults = null;
 
-// The briefing's line saying how setting the race up in LMU is going, while it runs.
-let lmuSetupLine = null;
-
-// Livery pictures from LMU's menus, by vehicle id, once fetched: data URLs, or null for none.
-const liveryImages = new Map();
-
-/** A livery's picture as a data URL, fetched once; null when LMU's menus have none. */
-function liveryImage(vehicleId) {
-  if (!liveryImages.has(vehicleId)) liveryImages.set(vehicleId, call("carImage", { vehicleId }).catch(() => null));
-  return liveryImages.get(vehicleId);
-}
-
 // The "what's new" tour this version shows once.
 const TOUR = "1.3";
 
@@ -172,15 +160,7 @@ export async function careerView(view, id, tab) {
   const stopPractice = onEvent("practiceRead", (message) => {
     if (message.careerId === id && location.hash.includes(id) && tab === "briefing") show("briefing");
   });
-  // Setting the race up in LMU reports as it goes.
-  const stopLmuSetup = onEvent("lmuSetup", (message) => {
-    if (message.careerId === id) lmuSetupProgress(message);
-  });
-  // LMU's car list came in: the car picker can show the liveries now.
-  const stopVehicles = onEvent("lmuVehicles", () => {
-    if (location.hash.includes(id) && tab === "briefing") show("briefing");
-  });
-  stopListening = () => { stopRound(); stopPractice(); stopLmuSetup(); stopVehicles(); };
+  stopListening = () => { stopRound(); stopPractice(); };
 
   // Results written while the app was closed or another screen was open turn up on arrival.
   if (armed()) {
@@ -358,17 +338,16 @@ export async function careerView(view, id, tab) {
         h("div", {},
           h("div", { class: "row", style: { alignItems: "baseline", marginBottom: "14px" } },
             h("div", { class: "section-title", style: { margin: 0 } }, t("Set up in LMU")), h("div", { class: "spacer" }), counter),
-          round.guest ? null : lmuSetupPanel(round, items, ticks, key),
           h("div", { class: "lmu-path" }, lmu("Circuit")),
           h("div", { class: "rows", style: { marginBottom: "16px" } },
             setting(lmu("Circuit"), track?.name ?? round.trackCourse, { big: true, tick: tick("circuit") }),
             setting(lmu("Layout"), layoutName(round), { big: true, tick: tick("layout") })),
           h("div", { class: "lmu-path" }, lmu("Car")),
-          h("div", { class: "rows", style: { marginBottom: "16px" } }, round.guest ? guestCarRow(round, tick("car")) : carRow(car, tick("car"), !isArmed)),
+          h("div", { class: "rows", style: { marginBottom: "16px" } }, round.guest ? guestCarRow(round, tick("car")) : carRow(car, tick("car"))),
           h("div", { class: "lmu-path" }, lmu("Event settings")),
           h("div", { class: "rows" },
-            sessionRow("practice", isArmed),
-            sessionRow("qualifying", isArmed),
+            setting(lmu("Practice"), t("Optional"), { hint: t("Run as much or as little as you like. After you start the weekend, your engineer reads it for pace."), untickable: true }),
+            setting(lmu("Qualifying"), t("Optional"), { hint: t("Skip it and LMU starts you from the back of the grid."), untickable: true }),
             setting(lmu("Race length"), [formatMinutes(round.raceMinutes), isArmed ? null
               : h("button", { class: "btn ghost small", style: { marginLeft: "10px" }, onclick: () => changeLength(round) }, t("Change"))],
               { big: true, tick: tick("length") }),
@@ -574,101 +553,21 @@ export async function careerView(view, id, tab) {
     return card;
   }
 
-  function carRow(car, tick, canPick) {
+  function carRow(car, tick) {
     const numbers = season().contract?.numbers ?? [];
     const name = data.carName || car.carType || t("Your car");
     if (car.customTeam) {
       return setting(name, t("Custom team"), { big: true, tick,
         hint: withSeason(t("Your {team} car, any number you like (last raced as #{n}).", { team: car.teamName || t("custom team"), n: car.carNumber }), car) });
     }
-    const shown = car.carNumber ? `#${car.carNumber}` : numbers.length ? carNumbers(numbers) : t("Any livery");
-    const hint = car.carNumber
-      ? (car.teamName ? t("Racing for {team}", { team: car.teamName }) : t("Same number as your last race"))
-      : numbers.length
-        ? t("Pick the {team} livery. Your first race sets your number for the season.", { team: teamName() })
-        : t("Pick any livery for this car. Your first race sets your number and team for the season.");
-    const value = h("span", {}, shown);
-    const row = setting(name, value, { big: true, tick, hint: withSeason(hint, car) });
-    if (canPick) carPicker(car, value, row);
-    return row;
-  }
-
-  /**
-   * Before the season's first race: the team and number to race, picked here, since Set it up in
-   * LMU for me loads that car. Each entry shows its livery as LMU's menus do, once the app has
-   * seen LMU's car list. Shows nothing extra once the season has raced (no choices left).
-   */
-  function carPicker(car, value, row) {
-    call("carChoices", { id }).then((choices) => {
-      if (!choices?.length || !value.isConnected) return;
-      const current = car.carNumber ? choices.find((e) => e.number === car.carNumber && (!car.teamName || e.team === car.teamName)) : null;
-      const thumb = current?.vehicleId ? h("img", { class: "livery-thumb", alt: "" }) : null;
-      if (thumb) liveryImage(current.vehicleId).then((src) => { if (src) thumb.src = src; else thumb.remove(); });
-      const button = h("button", { class: "btn ghost small livery-button", onclick: () => carGallery(choices, current) },
-        thumb, current ? `#${current.number} · ${current.team}` : t("Pick your car"));
-      put(clear(value), button);
-      const small = row.querySelector(".label small");
-      if (small) small.textContent = t("The team and number you'll race this season. Set it up in LMU for me loads this car.");
-    }).catch(() => {});
-  }
-
-  /** The entries to pick from, each with its livery when LMU's list has it. */
-  function carGallery(choices, current) {
-    const key = (e) => `${e.team}|${e.number}`;
-    const pictures = choices.some((e) => e.vehicleId);
-    const cards = choices.map((e) => {
-      const picture = h("div", { class: "livery-img" }, h("span", { class: "faint" }, e.vehicleId ? "" : t("No picture")));
-      if (e.vehicleId) liveryImage(e.vehicleId).then((src) => { if (src) put(clear(picture), h("img", { src, alt: e.livery ?? "" })); });
-      return h("button", {
-        class: "card clickable livery-card" + (current && key(e) === key(current) ? " selected" : ""),
-        onclick: async () => {
-          closeModal();
-          if (await attempt(call("chooseCar", { id, team: e.team, number: e.number }))) show("briefing");
-        },
-      }, picture, h("div", { class: "livery-name" }, `#${e.number}`), h("div", { class: "faint" }, e.team));
-    });
-    showModal([
-      h("h2", {}, t("Pick your car")),
-      h("p", { class: "muted" }, pictures
-        ? t("The livery each car runs in this race, as LMU shows it.")
-        : t("Open LMU once with Factory Seat running to see each car's livery here.")),
-      h("div", { class: "livery-grid" }, cards),
-      h("div", { class: "modal-actions" }, h("button", { class: "btn ghost", "data-sound": "back", onclick: closeModal }, t("Cancel"))),
-    ], { wide: true });
-  }
-
-  /**
-   * Practice or qualifying for the weekend: off or a length, and the session's time scale (how
-   * fast the track rubbers in). Picked here for Set it up in LMU for me, and kept for every race.
-   */
-  function sessionRow(kind, isArmed) {
-    const practice = kind === "practice";
-    const sessions = { practiceMinutes: 30, practiceTimeScale: 0, qualifyingMinutes: 20, qualifyingTimeScale: 1, ...(state.settings.lmuSessions ?? {}) };
-    const minutesKey = practice ? "practiceMinutes" : "qualifyingMinutes";
-    const scaleKey = practice ? "practiceTimeScale" : "qualifyingTimeScale";
-    const lengths = practice ? [10, 15, 20, 30, 45, 60, 90, 120, 180] : [10, 15, 20, 30, 45, 60];
-    const scales = [[0, lmu("Static")], [1, lmu("Normal")], [2, "2x"], [3, "3x"], [5, "5x"]];
-    const minutes = sessions[minutesKey];
-    const save = async (change) => {
-      const next = await attempt(call("setPrefs", { lmuSessions: { ...sessions, ...change } }));
-      if (next) { state.settings = next; show("briefing"); }
-    };
-    const hint = practice
-      ? t("After you start the weekend, your engineer reads practice for pace.")
-      : t("Without qualifying, LMU starts you from the back of the grid.");
-    const label = practice ? lmu("Practice") : lmu("Qualifying");
-    if (isArmed) {
-      const scale = scales.find(([v]) => v === sessions[scaleKey])?.[1] ?? "";
-      return setting(label, minutes > 0 ? `${formatMinutes(minutes)} · ${scale}` : t("Off"), { hint, untickable: true });
+    if (car.carNumber) {
+      return setting(name, `#${car.carNumber}`, { big: true, tick,
+        hint: withSeason(car.teamName ? t("Racing for {team}", { team: car.teamName }) : t("Same number as your last race"), car) });
     }
-    const length = h("select", { class: "input", style: { width: "130px" }, onchange: (e) => save({ [minutesKey]: Number(e.target.value) }) },
-      h("option", { value: "0", selected: minutes === 0 }, t("Off")),
-      lengths.map((m) => h("option", { value: String(m), selected: m === minutes }, formatMinutes(m))));
-    const scale = minutes > 0
-      ? h("select", { class: "input", style: { width: "120px" }, title: t("Time scale: how fast the track rubbers in"), onchange: (e) => save({ [scaleKey]: Number(e.target.value) }) },
-        scales.map(([v, text]) => h("option", { value: String(v), selected: v === sessions[scaleKey] }, text)))
-      : null;
-    return setting(label, h("span", { class: "row", style: { gap: "8px", justifyContent: "flex-end" } }, length, scale), { hint, untickable: true });
+    return setting(name, numbers.length ? carNumbers(numbers) : t("Any livery"), { big: true, tick,
+      hint: withSeason(numbers.length
+        ? t("Pick the {team} livery. Your first race sets your number for the season.", { team: teamName() })
+        : t("Pick any livery for this car. Your first race sets your number and team for the season."), car) });
   }
 
   /** A guest drive is in the guest team's car, not the season's. */
@@ -824,60 +723,6 @@ export async function careerView(view, id, tab) {
         h("div", { class: "n" }, i + 1), h("div", {}, h("b", {}, title), h("div", { class: "muted" }, text)))),
       h("div", { class: "faint", style: { marginTop: "10px", fontSize: "12px" } },
         t("To score, drive at least {n}% of the laps (about {time}).", { n: minShare, time: formatMinutes(minMinutes) })));
-  }
-
-  /**
-   * Sets the race up in LMU through the game's own local API and loads the weekend: the same
-   * settings as the rows below, without the clicking. LMU has to be open, on its main menu.
-   */
-  function lmuSetupPanel(round, items, ticks, key) {
-    const line = h("div", { class: "faint" }, t("LMU open on its main menu? Factory Seat can set all of this up and load the weekend for you."));
-    const button = h("button", { class: "btn small", "data-sound": "confirm" }, t("Set it up in LMU for me"));
-    button.onclick = async () => {
-      button.disabled = true;
-      line.textContent = t("Talking to LMU…");
-      lmuSetupLine = { line, button, ticks, items, key };
-      const started = await attempt(call("setUpInLmu", { id }));
-      if (!started) {
-        button.disabled = false;
-        line.textContent = t("LMU open on its main menu? Factory Seat can set all of this up and load the weekend for you.");
-        lmuSetupLine = null;
-      }
-    };
-    return h("div", { class: "notice info", style: { marginBottom: "16px" } },
-      h("div", { class: "row", style: { alignItems: "center", gap: "12px" } }, line, h("div", { class: "spacer" }), button));
-  }
-
-  /** An lmuSetup event: a step done, the weekend loaded, or what went wrong. */
-  function lmuSetupProgress(message) {
-    const steps = {
-      connect: t("Talking to LMU…"),
-      track: t("Setting the track…"),
-      car: t("Picking your car…"),
-      settings: t("Setting the race up…"),
-      check: t("Checking LMU took it all…"),
-      load: t("Loading the weekend in LMU…"),
-    };
-    const ui = lmuSetupLine;
-    if (message.status === "working") {
-      if (ui) ui.line.textContent = steps[message.step] ?? t("Talking to LMU…");
-      return;
-    }
-    lmuSetupLine = null;
-    if (message.status === "done") {
-      if (ui) { for (const item of ui.items) ui.ticks.add(item); saveTicks(ui.key, ui.ticks); }
-      sound.confirm();
-      toast(t("The weekend is loaded in LMU, and it's started here. Go race."));
-      if (tab === "briefing") show("briefing");
-      return;
-    }
-    toast(message.phrase ? t(message.phrase) : message.error, { error: true });
-    if (ui) {
-      ui.button.disabled = false;
-      ui.line.textContent = t("LMU open on its main menu? Factory Seat can set all of this up and load the weekend for you.");
-    }
-    // The weekend may have started before the load went wrong.
-    if (tab === "briefing") show("briefing");
   }
 
   function weekendPanel(round, isArmed) {
