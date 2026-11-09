@@ -2,12 +2,11 @@
 
 Le Mans Ultimate runs an HTTP server on the local machine while the game is open.
 The in-game UI is built on it, so anything the menus can do (pick a series, a track, a
-car, build a session, load it, leave it) can be scripted. We used it in April 2026 to
-cycle every car and track combination and read each car's BoP mass out of the game's
-trace log (`scripts/collect_bop.py`).
+car, build a session, load it, leave it) can be scripted. We first mapped it in April
+2026 with scripts that set up and loaded sessions.
 
-This file records every call those scripts made, the payload shape that worked, and
-the quirks that cost time. Nothing here comes from official documentation: it is what
+This file records the calls, the payload shape that worked, and the quirks that cost
+time. Nothing here comes from official documentation: it is what
 we observed against game version 1.23 era builds. Field lists are the fields we read,
 not the full response.
 
@@ -15,9 +14,7 @@ Scripts that use it, all in `scripts/`:
 
 | Script | What it does |
 |---|---|
-| `collect_bop.py` | The full automation loop over every car and track combo |
-| `_test_flow.py` | The same flow, one step at a time, printing every status and body |
-| `_layout_collect.py` | The loop for one car across alternate layouts |
+| `_test_flow.py` | The setup-and-load flow, one step at a time, printing every status and body |
 | `probe_api.py` | First probe: set track, set car, load default setup |
 | `_list_tracks.py`, `_list_folders.py`, `dump_tracks.py` | List tracks and car folders, dump track JSON (`tracks_dump.json`) |
 
@@ -92,7 +89,7 @@ Values we relied on:
 |---|---|---|
 | `navigationState` | `NAV_MAIN_MENU`, `NAV_SETUP` | In the menus; safe to set up a new session |
 | `navigationState` | `NAV_EVENT` | Inside a loaded session |
-| `gameState` | `GSTATE_DYN` | Physics running. The car is loaded and its mass has been written to the trace |
+| `gameState` | `GSTATE_DYN` | Physics running: the car is loaded on track |
 
 A failed request or an empty `state` means the game is not reachable. The scripts use
 this call as their "is LMU running" check.
@@ -172,7 +169,7 @@ One entry, weather arrays trimmed:
 Notes:
 
 - `id` goes to `POST /rest/race/track`. `sceneDesc` goes to `getDefaultPresetForTrack`.
-- `sceneDesc` is the layout key and the name the trace log uses. Main layouts end in
+- `sceneDesc` is the layout key. Main layouts end in
   `WEC` or `ELMS` (`SPAWEC`, `SPAELMS`); alternates carry a suffix (`SPAWEC_ENDCE`,
   `BAHRAINWEC_OUTER`, `PAULRICARD1A-V2-SHORT`). The scripts select a series' main
   layouts with the regex `WEC$` or `ELMS$`.
@@ -254,16 +251,14 @@ track and car. Fields we read or changed:
 | `Player["Game Options"]["Drivers Per Vehicle AI"]` | Set to `0` |
 | `Grid` | Set to `[]` to drop the AI field |
 
-Emptying the grid and opponents makes each load much faster, which matters when the
-loop runs hundreds of times.
+Emptying the grid and opponents makes a load much faster, which helps for test loads.
 
 ## Garage
 
 ### `POST /rest/garage/setup/default`
 
 No body. Loads the default setup for the current car. Used only in `probe_api.py`;
-it does not on its own make the game load the car into a session, so it did not
-trigger the mass line we needed.
+it does not load the car into a session.
 
 ## Load
 
@@ -579,39 +574,3 @@ All under `/rest/`.
 `getAuthSessionTicket` and `cancelSteamAuth` touch the player's Steam login. Studio 397's
 November 2026 statement was about tools using that login against their online services, so
 leave those alone.
-
-## What the API does not give you: the car mass
-
-No endpoint returns the car's weight. Once a session reaches `GSTATE_DYN`, the game
-writes it to the newest `trace_*.txt` in
-`C:\Program Files (x86)\Steam\steamapps\common\Le Mans Ultimate\UserData\Log`.
-Three lines belong together, in this order:
-
-```
-garageLoad.c 1616: ... & Track <sceneDesc>.
-vehicle.cpp 1418: ... Vehicles\<CarFolder>\...
-vehicle.cpp 1435: Simulation Mass: MassSF <f> FuelMass <f> BopPen <f> PenMass <f> Total <f>
-```
-
-Regexes from `scripts/watch_bop.py`:
-
-```python
-GARAGE = r"garageLoad\.c\s+1616:.*?& Track (?P<track>\w+)\."
-CAR    = r"vehicle\.cpp\s+1418:.*?Vehicles[\\/](?P<car>[^\\/]+)[\\/]"
-MASS   = (r"vehicle\.cpp\s+1435: Simulation Mass: "
-          r"MassSF (?P<mass_sf>[\d.]+) FuelMass (?P<fuel_mass>[\d.]+) "
-          r"BopPen (?P<bop_pen>[\d.]+) PenMass (?P<pen_mass>[\d.]+) Total (?P<total>[\d.]+)")
-```
-
-Reset the car when a new `garageLoad` line appears, and only accept a mass line after
-both a track and a car have been seen. To read only the current load, note the trace
-file size before `loadGame` and read forward from that offset
-(`_layout_collect.py`, `read_mass_from_trace`).
-
-Findings from the collection:
-- The base weight work treated `MassSF` as base weight plus the BoP weight penalty:
-  `calc_base_weight.py` subtracts the Steam patch notes' `WeightPenalty` from it and
-  takes the lowest result across tracks as the car's base weight. Fuel is reported
-  separately in `FuelMass`.
-- Alternate layouts at the same venue gave the same `MassSF` as the main layout
-  (`_layout_collect.py` + `_layout_test.py`), so only main layouts need collecting.
