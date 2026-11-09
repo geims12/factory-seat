@@ -25,6 +25,7 @@ Race your way to a Hypercar seat, one season at a time: up the GT road from LMGT
 - **Achievements and a 3D trophy room.** 20 achievements to earn (a few of them secret), a trophy for every track and a cup for every title, records, and a season card to share.
 - **New Game+.** Retire a career into the Hall of Fame, then climb the ladder again on a raised floor: tougher AI, a third of the races wet, damage on, and every race checked against it. Your retired careers unlock head starts.
 - **Season builder.** A default world or European calendar for your class, with every race's length adjustable and events you can add, reorder or make up yourself.
+- **One-click setup.** With LMU open on its main menu, **Set it up in LMU for me** sets the race up in the game (track, layout, your car, the season's grid, race length, Time Scale, Fuel Usage, Tyre Wear and start time) and loads the weekend.
 - **Race briefings** in LMU's own setting names: track and layout, race length, Time Scale, Fuel Usage, Tyre Wear and start time, plus a pit plan.
 - **Automatic results.** Leave the app open while you race. It watches LMU's results folder and pops up when the race ends. Only races that match the briefing count, so test drives and online races never do.
 - **Championship standings** for every class, with WEC-style points, double points at the 24-hour races, and pole points.
@@ -67,18 +68,20 @@ The Linux build is new, so if something doesn't work, a [bug report](../../issue
 ## How a race weekend works
 
 1. Open your career and read the **Next race** briefing.
-2. Press **Start race weekend**. Only results written after this count.
-3. Set up an offline Race Weekend in LMU with the briefing's settings, and race. Qualifying is optional.
+2. With LMU open on its main menu, press **Set it up in LMU for me**. The app sets the race up in LMU, starts the race weekend, and loads it in the game. Pick your car (before the season's first race) and the practice and qualifying you want in the briefing first; either can be off.
+
+   Or do it by hand: press **Start race weekend** (only results written after this count), then set up an offline Race Weekend in LMU with the briefing's settings.
+3. Race.
 4. When the race ends, the app pops up with your result. Count it, and the standings update.
 
 At the end of the season you get a review, a reputation change, and offers for next season.
 
 ## Good to know
 
-- **The app only reads LMU's results files.** It never changes game files or settings, and it doesn't automate anything in the game.
+- **The app never changes LMU's files.** It reads the results files LMU writes. When you press **Set it up in LMU for me**, it sets the race up through the game's own local interface, the one LMU's menus use, on your PC: the same settings you'd pick in the menus, and nothing else. Without that button it doesn't touch the game.
 - **DLC ownership is on trust.** LMU installs every pack's files whether you own it or not, so the app asks you which packs you have. Offers and calendars only use those.
 - **Your careers** are saved in `%AppData%\LmuCareer` (`~/.config/LmuCareer` on Linux). Uninstalling asks before it deletes them.
-- **Network:** the app's only online request is an optional check for a newer release on GitHub when it starts. You can turn it off in Settings. The app collects no data and has no accounts or servers. Its window is drawn by Microsoft's WebView2 runtime, a Windows component that may contact Microsoft for its own updates, just as it does for other apps that use it.
+- **Network:** setting a race up talks only to LMU on your own PC (`localhost`), never over the internet. The app's only online request is an optional check for a newer release on GitHub when it starts. You can turn it off in Settings. The app collects no data and has no accounts or servers. Its window is drawn by Microsoft's WebView2 runtime, a Windows component that may contact Microsoft for its own updates, just as it does for other apps that use it.
 - **Factory Seat Companion** is a free SimHub overlay by Milky28, a community project separate from Factory Seat. It checks LMU's race setup against your briefing right over LMU's menus, so you don't have to switch windows, which helps when you're streaming or recording. Get it on [its GitHub page](https://github.com/Milky28/factory-seat-companion).
 - **Code signing:** official Windows releases are built by GitHub Actions from this public source; see the [code signing policy](docs/CODE_SIGNING.md).
 
@@ -88,7 +91,10 @@ At the end of the season you get a review, a reputation change, and offers for n
 No. Only offline Race Weekends count, and only the one that matches your current briefing. Online races, test drives and any other offline races are ignored, so you can race whatever else you like in LMU without affecting your career.
 
 **Does the LMU API ban affect Factory Seat?**
-No. Factory Seat doesn't use any LMU API, online or local. It only reads the files LMU saves on your own PC (race results, settings and saves) after you race offline. It never talks to Studio 397's servers, never logs in to your account, and never changes the game. Its only internet connection is checking GitHub for app updates.
+No. Studio 397's November 2026 notice is about tools that use your Steam login to pull rankings and results from their online servers. Factory Seat never talks to Studio 397's servers and never logs in to your account. When you press **Set it up in LMU for me**, it uses the local interface LMU's own menus run on, on your PC while the game is open, to make the same choices you'd make in the menus. Otherwise it only reads the files LMU saves on your PC (race results, settings and saves). Its only internet connection is checking GitHub for app updates.
+
+**What if Set it up in LMU for me doesn't work?**
+Set the race up in LMU by hand as before: the briefing lists every setting. The button needs LMU open on its main menu, and it can't set up IMSA rounds, guest drives, test days or Race Control custom team cars yet. LMU's interface isn't public, so a game update can break it; the manual way always works.
 
 **Do I need all the DLC?**
 No. When you start a career you tick the packs you own, and calendars, cars and offers stick to those. With only the base game, calendars use the base tracks, and LMP3 is raced in the free ADESS AD25.
