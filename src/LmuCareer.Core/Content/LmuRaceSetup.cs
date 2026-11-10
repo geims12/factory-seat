@@ -36,12 +36,51 @@ public sealed record LmuVehicle(string Id, string Folder, string Description, IR
 /// <param name="Id">What <c>POST /rest/race/track</c> takes.</param>
 /// <param name="SceneDesc">The layout's key, e.g. SPAWEC_ENDCE.</param>
 /// <param name="Folder">LMU's cmpName, which is the track's folder under Installed\Locations.</param>
-public sealed record LmuTrack(string Id, string SceneDesc, string Folder)
+/// <param name="Owned">LMU's isOwned: the player can race it (Steam ownership, as LMU's menus use it).</param>
+public sealed record LmuTrack(string Id, string SceneDesc, string Folder, bool Owned = true)
 {
     public static LmuTrack? From(JsonNode? node) =>
         node is JsonObject o && o["id"]?.ToString() is { Length: > 0 } id && o["sceneDesc"]?.ToString() is { Length: > 0 } scene
-            ? new LmuTrack(id, scene, o["cmpName"]?.ToString() ?? "")
+            ? new LmuTrack(id, scene, o["cmpName"]?.ToString() ?? "",
+                o["isOwned"] is JsonValue owned && owned.TryGetValue(out bool isOwned) ? isOwned : true)
             : null;
+}
+
+/// <summary>Which packs LMU says the player owns. <see cref="Unsure"/>: partly owned, or LMU didn't list all of it.</summary>
+public sealed record OwnedPacks(IReadOnlyList<string> Owned, IReadOnlyList<string> NotOwned, IReadOnlyList<string> Unsure);
+
+/// <summary>
+/// DLC ownership as LMU's own menus see it: the isOwned flag on each track and car, which LMU uses
+/// to lock what the player can't race. Installed files prove nothing (every pack is installed).
+/// Credit: thebaz's windows-weekend branch.
+/// </summary>
+public static class LmuOwnership
+{
+    /// <summary>
+    /// A pack is owned when LMU lists every one of its tracks and cars as owned, and not owned when
+    /// it lists them all as not owned. Partly owned or partly missing packs are left to the player.
+    /// </summary>
+    public static OwnedPacks Packs(ContentCatalog catalog, IReadOnlyList<LmuTrack> tracks, IReadOnlyList<LmuVehicle> vehicles)
+    {
+        if (tracks.Count == 0 || vehicles.Count == 0) throw new PlayerError("LMU didn't list its tracks and cars. Go to its main menu and try again.");
+        // A track or car counts as owned when any of its layouts or liveries is.
+        var trackOwned = tracks.GroupBy(t => t.Folder, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Any(t => t.Owned), StringComparer.OrdinalIgnoreCase);
+        var carOwned = vehicles.GroupBy(v => v.Folder, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Any(v => v.Owned), StringComparer.OrdinalIgnoreCase);
+
+        List<string> owned = [], notOwned = [], unsure = [];
+        foreach (var pack in catalog.Packs.Where(p => p.Id != ContentCatalog.BasePack))
+        {
+            var items = catalog.Tracks.Where(t => t.Pack == pack.Id).Select(t => trackOwned.TryGetValue(t.Folder, out var o) ? o : (bool?)null)
+                .Concat(catalog.Cars.Where(c => c.Pack == pack.Id).Select(c => carOwned.TryGetValue(c.Folder, out var o) ? o : (bool?)null))
+                .ToList();
+            if (items.Count > 0 && items.All(o => o == true)) owned.Add(pack.Id);
+            else if (items.Count > 0 && items.All(o => o == false)) notOwned.Add(pack.Id);
+            else unsure.Add(pack.Id);
+        }
+        return new(owned, notOwned, unsure);
+    }
 }
 
 /// <summary>
@@ -57,13 +96,29 @@ public sealed record LmuSessions(int PracticeMinutes, double PracticeTimeScale, 
     public static readonly IReadOnlyList<int> QualifyingLengths = [10, 15, 20, 30, 45, 60];
     public static readonly IReadOnlyList<double> TimeScales = [0, 1, 2, 3, 5];
 
-    /// <summary>The nearest values the app offers: a session is off or one of the lengths.</summary>
+    /// <summary>A private session: the player alone on track (LMU's PrivatePractice / PrivateQualifying).</summary>
+    public bool PracticePrivate { get; init; } = true;
+    public bool QualifyingPrivate { get; init; }
+
+    /// <summary>When the session starts, in minutes from midnight; -1 for the track's default.</summary>
+    public int PracticeStart { get; init; } = -1;
+    public int QualifyingStart { get; init; } = -1;
+
+    /// <summary>The nearest values the app offers: a session is off or one of the lengths; starts on the half hour.</summary>
     public LmuSessions Normalized() => new(
         Snap(PracticeMinutes, PracticeLengths), TimeScales.MinBy(x => Math.Abs(x - PracticeTimeScale)),
-        Snap(QualifyingMinutes, QualifyingLengths), TimeScales.MinBy(x => Math.Abs(x - QualifyingTimeScale)));
+        Snap(QualifyingMinutes, QualifyingLengths), TimeScales.MinBy(x => Math.Abs(x - QualifyingTimeScale)))
+    {
+        PracticePrivate = PracticePrivate,
+        QualifyingPrivate = QualifyingPrivate,
+        PracticeStart = Start(PracticeStart),
+        QualifyingStart = Start(QualifyingStart),
+    };
 
     private static int Snap(int minutes, IReadOnlyList<int> lengths) =>
         minutes <= 0 ? 0 : lengths.MinBy(l => Math.Abs(l - minutes));
+
+    private static int Start(int minutes) => minutes is < 0 or >= 1440 ? -1 : (int)Math.Round(minutes / 30.0) * 30 % 1440;
 }
 
 /// <summary>
@@ -302,8 +357,19 @@ public static class LmuRaceSetup
         conditions["Run Warmup"] = false;
         conditions["Num Qual Sessions"] = sessions.QualifyingMinutes > 0 ? 1 : 0;
         conditions["Num Race Sessions"] = 1;
-        if (sessions.PracticeMinutes > 0) options["practice length"] = sessions.PracticeMinutes;
-        if (sessions.QualifyingMinutes > 0) options["qualifying length"] = sessions.QualifyingMinutes;
+        // A session left out keeps LMU's length, privacy and start for it.
+        if (sessions.PracticeMinutes > 0)
+        {
+            options["practice length"] = sessions.PracticeMinutes;
+            conditions["PrivatePractice"] = sessions.PracticePrivate;
+            conditions["Practice1StartingTime"] = sessions.PracticeStart;
+        }
+        if (sessions.QualifyingMinutes > 0)
+        {
+            options["qualifying length"] = sessions.QualifyingMinutes;
+            conditions["PrivateQualifying"] = sessions.QualifyingPrivate ? 1 : 0;
+            conditions["QualifyingStartingTime"] = sessions.QualifyingStart;
+        }
 
         if (plan.Wet && preset["Weather"]?["Race"]?["Weather"] is JsonArray slots)
         {

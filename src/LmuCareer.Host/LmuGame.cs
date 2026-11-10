@@ -20,18 +20,74 @@ public sealed class LmuGame : IDisposable
     public void Dispose() => _http.Dispose();
 
     /// <summary>Where the game is: navigationState and gameState; null when LMU isn't running.</summary>
-    public async Task<(string Navigation, string Game)?> StateAsync(CancellationToken cancel)
+    public async Task<(string Navigation, string Game)?> StateAsync(CancellationToken cancel) =>
+        await ReadinessAsync(cancel) is { Readiness: not LmuReadiness.NotRunning } state ? (state.Navigation, state.Game) : null;
+
+    /// <summary>
+    /// Whether a race can be set up now. LMU's offline menu reports NAV_MAIN_MENU (or NAV_SETUP),
+    /// GSTATE_SETUP, SETTING_GRANDPRIX and not loading. After a session LMU can keep reporting
+    /// NAV_EVENT and GSTATE_DYN even with its home screen showing: when GetGameState says that
+    /// session sits in the monitor (no replay, the car loaded), it's a retained session the player
+    /// can choose to replace. Anything else (driving, a replay, loading, multiplayer) is busy.
+    /// Credit: thebaz's windows-weekend branch found the retained session.
+    /// </summary>
+    public async Task<LmuState> ReadinessAsync(CancellationToken cancel)
     {
+        JsonNode? root;
         try
         {
-            var state = (await GetAsync("/navigation/state", cancel))?["state"];
-            return state?["navigationState"]?.ToString() is { } nav ? (nav, state["gameState"]?.ToString() ?? "") : null;
+            root = await GetAsync("/navigation/state", cancel);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException && !cancel.IsCancellationRequested)
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or LmuApiException && !cancel.IsCancellationRequested)
         {
-            return null;
+            return new(LmuReadiness.NotRunning, "", "", "", null);
         }
+
+        var state = root?["state"];
+        var navigation = state?["navigationState"]?.ToString() ?? "";
+        var game = state?["gameState"]?.ToString() ?? "";
+        var mode = state?["settingMode"]?.ToString() ?? "";
+        bool? loading = root?["loadingStatus"]?["loading"] is JsonValue l && l.TryGetValue(out bool b) ? b : null;
+        LmuState As(LmuReadiness readiness) => new(readiness, navigation, game, mode, loading);
+        if (navigation.Length == 0) return As(LmuReadiness.NotRunning);
+
+        var idleOffline = loading == false && mode == "SETTING_GRANDPRIX";
+        if (idleOffline && navigation is "NAV_MAIN_MENU" or "NAV_SETUP" && game == "GSTATE_SETUP") return As(LmuReadiness.Menu);
+        if (idleOffline && navigation == "NAV_EVENT" && game == "GSTATE_DYN")
+        {
+            JsonNode? session;
+            try
+            {
+                session = await GetAsync("/rest/sessions/GetGameState", cancel);
+            }
+            catch (LmuApiException)
+            {
+                return As(LmuReadiness.Busy);
+            }
+            if (Bool(session?["inMonitor"]) == true && Bool(session?["isReplayActive"]) == false && Bool(session?["playerVehicleLoaded"]) == true)
+                return As(LmuReadiness.RetainedSession);
+        }
+        return As(LmuReadiness.Busy);
     }
+
+    /// <summary>
+    /// Stops unless LMU is on its offline menu, or holds a retained session the player chose to
+    /// replace. Checked before the setup starts and again just before the load.
+    /// </summary>
+    private async Task<LmuState> EnsureReadyAsync(bool replaceRetained, CancellationToken cancel)
+    {
+        var state = await ReadinessAsync(cancel);
+        return state.Readiness switch
+        {
+            LmuReadiness.Menu => state,
+            LmuReadiness.RetainedSession when replaceRetained => state,
+            LmuReadiness.RetainedSession => throw new LmuRetainedSessionException(),
+            LmuReadiness.NotRunning => throw new PlayerError("LMU isn't running. Start it, go to its main menu, and try again."),
+            _ => throw new PlayerError("LMU is busy ({state}). Go to its offline Race Weekend menu, and try again.", ("state", state.Describe())),
+        };
+    }
+
+    private static bool? Bool(JsonNode? node) => node is JsonValue v && v.TryGetValue(out bool b) ? b : null;
 
     public async Task<IReadOnlyList<LmuVehicle>> VehiclesAsync(CancellationToken cancel) =>
         (await GetAsync("/rest/sessions/getAllVehicles", cancel) as JsonArray ?? []).Select(LmuVehicle.From).OfType<LmuVehicle>().ToList();
@@ -44,8 +100,18 @@ public sealed class LmuGame : IDisposable
     /// runs once everything is set and checked, just before the load (the app starts the race weekend
     /// there, so only races from now on count). <paramref name="step"/> hears each stage.
     /// </summary>
-    public async Task SetUpAsync(LmuRacePlan plan, LmuTrack track, Func<Task> beforeLoad, Action<string> step, CancellationToken cancel)
+    /// <param name="replaceRetained">The player confirmed replacing a session LMU still holds.</param>
+    /// <param name="load">Load the weekend. Off: stop with it all set on LMU's menu, where LMU's own
+    /// settings screen reads it fresh (its loader calls requestPreset) for the player to check and start.</param>
+    public async Task SetUpAsync(LmuRacePlan plan, LmuTrack track, bool replaceRetained, bool load, Func<Task> beforeLoad, Action<string> step,
+        CancellationToken cancel)
     {
+        if ((await EnsureReadyAsync(replaceRetained, cancel)).Readiness == LmuReadiness.RetainedSession)
+        {
+            step("release");
+            await ReleaseRetainedAsync(cancel);
+        }
+
         step("track");
         await PostJsonAsync("/rest/sessions/Championship/setCurrentChampionshipTemplate", new JsonObject { ["name"] = plan.Championship }, cancel);
         await Settle(cancel);
@@ -75,24 +141,84 @@ public sealed class LmuGame : IDisposable
         var set = await PostJsonAsync("/rest/sessions/SessionPresets/requestPreset", null, cancel) as JsonObject
             ?? throw new PlayerError("LMU didn't give its race settings. Go to LMU's main menu and try again.");
         Check(set, plan);
+        await CheckSelectionAsync(plan, cancel);
+
+        // The save LMU builds must hold what was checked; nothing is loaded otherwise.
+        var save = await PostJsonAsync("/rest/sessions/SaveLoad/generateSaveFileFromSessionPreset", set, cancel) as JsonObject
+            ?? throw new PlayerError("LMU couldn't build the race weekend. Go to LMU's main menu and try again.");
+        if (save["SessionPreset"] is not JsonObject saved)
+            throw new PlayerError("LMU couldn't build the race weekend. Go to LMU's main menu and try again.");
+        Check(saved, plan);
+        // The player may have started something in LMU meanwhile.
+        await EnsureReadyAsync(false, cancel);
 
         await beforeLoad();
+        if (!load) return;
 
         step("load");
-        var save = await PostJsonAsync("/rest/sessions/SaveLoad/generateSaveFileFromSessionPreset", set, cancel)
-            ?? throw new PlayerError("LMU couldn't build the race weekend. Go to LMU's main menu and try again.");
-        var load = new JsonObject { ["save"] = save };
-        if (plan.AiStrength is { } patchStrength) load["patch"] = new JsonObject { ["aiStrength"] = patchStrength };
-        await PostJsonAsync("/rest/sessions/SaveLoad/loadGame", load, cancel);
+        var request = new JsonObject { ["save"] = save.DeepClone() };
+        if (plan.AiStrength is { } patchStrength) request["patch"] = new JsonObject { ["aiStrength"] = patchStrength };
+        // Never retried: a timeout doesn't prove LMU didn't get it.
+        await PostJsonAsync("/rest/sessions/SaveLoad/loadGame", request, cancel);
 
         // The call returns before the load is done.
         var until = DateTime.UtcNow.AddMinutes(3);
         while (DateTime.UtcNow < until)
         {
             await Task.Delay(TimeSpan.FromSeconds(2), cancel);
-            if ((await StateAsync(cancel))?.Navigation == "NAV_EVENT") return;
+            var now = await ReadinessAsync(cancel);
+            if (now.Navigation == "NAV_EVENT" && now.Loading != true) return;
         }
         throw new PlayerError("LMU is still loading the weekend. Check the game: if it loaded, go race; the weekend has started.");
+    }
+
+    /// <summary>
+    /// Ends the session LMU still holds, the way its own exit does (NAV_TO_MAIN_MENU), and waits for
+    /// the offline menu. Loading over a retained session left LMU's screen on its home page with the
+    /// weekend loaded behind it: the menu only moves to the loading and weekend screens when a load
+    /// starts from the menu.
+    /// </summary>
+    private async Task<LmuState> ReleaseRetainedAsync(CancellationToken cancel)
+    {
+        // LMU's menu sends this with a JSON null body; with no body at all the call never answers.
+        using (var content = new StringContent("null", Encoding.UTF8, "application/json"))
+        using (var response = await _http.PostAsync("/navigation/action/NAV_TO_MAIN_MENU", content, cancel))
+            await Read(response, "/navigation/action/NAV_TO_MAIN_MENU", cancel);
+
+        var until = DateTime.UtcNow.AddSeconds(45);
+        while (DateTime.UtcNow < until)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(1), cancel);
+            if (await ReadinessAsync(cancel) is { Readiness: LmuReadiness.Menu } menu)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(2), cancel);
+                return menu;
+            }
+        }
+        throw new PlayerError("LMU didn't close its earlier session. Go to its main menu, and try again.");
+    }
+
+    /// <summary>
+    /// The track and car LMU's session screen holds (GET /rest/garage/UIScreen/SessionSetup), as the
+    /// menus read them. A build without that screen falls back to the preset's own check.
+    /// </summary>
+    private async Task CheckSelectionAsync(LmuRacePlan plan, CancellationToken cancel)
+    {
+        JsonNode? selection;
+        try
+        {
+            selection = await GetAsync("/rest/garage/UIScreen/SessionSetup", cancel);
+        }
+        catch (LmuApiException)
+        {
+            return;
+        }
+        var scene = selection?["trackInfo"]?["sceneDesc"]?.ToString();
+        var car = selection?["selectedCar"]?["id"]?.ToString();
+        if (scene is not null && !scene.Equals(plan.SceneDesc, StringComparison.OrdinalIgnoreCase))
+            throw new PlayerError("LMU didn't take the {setting} Factory Seat sent. Set this race up in LMU yourself.", ("setting", "track"));
+        if (car is not null && car != plan.Player.Id)
+            throw new PlayerError("LMU didn't take the {setting} Factory Seat sent. Set this race up in LMU yourself.", ("setting", "car"));
     }
 
     /// <summary>What LMU holds after the setup must be what was sent; a mismatch stops before the load.</summary>
@@ -180,3 +306,17 @@ public sealed class LmuGame : IDisposable
 
 /// <summary>LMU answered, but not with success: a bug report's worth, not something the player did.</summary>
 public sealed class LmuApiException(string message) : Exception(message);
+
+public enum LmuReadiness { NotRunning, Menu, RetainedSession, Busy }
+
+/// <summary>What /navigation/state says, read for whether a race can be set up.</summary>
+public sealed record LmuState(LmuReadiness Readiness, string Navigation, string Game, string SettingMode, bool? Loading)
+{
+    /// <summary>The states only, never player, car or track data: for the player's message.</summary>
+    public string Describe() =>
+        $"{(Navigation.Length > 0 ? Navigation : "?")}, {(Game.Length > 0 ? Game : "?")}, {(SettingMode.Length > 0 ? SettingMode : "?")}"
+        + (Loading == true ? ", loading" : "");
+}
+
+/// <summary>LMU still holds an offline session; setting a race up replaces it, so the player confirms first.</summary>
+public sealed class LmuRetainedSessionException() : Exception("LMU still holds an offline session.");

@@ -144,6 +144,11 @@ public sealed class ApiHost
         "importCareer" => ImportCareer(),
         "armRound" => Change(args, c => Arm(StillRacing(c))),
         "setUpInLmu" => SetUpInLmu(args),
+        "lmuConsent" => new { granted = _lmuConsent },
+        "grantLmuConsent" => GrantLmuConsent(args),
+        "revokeLmuConsent" => RevokeLmuConsent(),
+        "setRoundSessions" => SetRoundSessions(args),
+        "detectOwnedPacks" => DetectOwnedPacks(),
         "carChoices" => CarChoices(args),
         "carImage" => CarImage(Str(args, "vehicleId")),
         "chooseCar" => Change(args, c =>
@@ -389,6 +394,7 @@ public sealed class ApiHost
                 .Where(s => s.Id.StartsWith("own-", StringComparison.Ordinal) && s.Name.Trim().Length > 0)
                 .Select(s => { s.Name = s.Name.Trim(); s.Region = s.Region.Trim(); return s; })
                 .ToList();
+        if (args.TryGetProperty("lmuLoadWeekend", out var loadWeekend)) _settings.LmuLoadWeekend = loadWeekend.GetBoolean();
         if (args.TryGetProperty("lmuSessions", out var sessions))
             _settings.LmuSessions = (JsonSerializer.Deserialize<LmuSessions>(sessions.GetRawText(), Json) ?? LmuSessions.Default).Normalized();
         if (args.TryGetProperty("builtLiveries", out var built))
@@ -764,6 +770,80 @@ public sealed class ApiHost
     // A race being set up in LMU, at most one at a time.
     private bool _settingUpLmu;
 
+    // The player allowed Factory Seat to use LMU's local interface: for this run of the app only,
+    // and only after reading the notice. Every call that reaches LMU checks it.
+    private bool _lmuConsent;
+    private const string LmuConsentVersion = "lmu-local-api-1";
+
+    private object GrantLmuConsent(JsonElement args)
+    {
+        if (Str(args, "version") != LmuConsentVersion) throw new PlayerError("Read the notice about LMU's interface again, then allow it.");
+        _lmuConsent = true;
+        return new { granted = true };
+    }
+
+    private object RevokeLmuConsent()
+    {
+        _lmuConsent = false;
+        return new { granted = false };
+    }
+
+    private void RequireLmuConsent()
+    {
+        if (!_lmuConsent) throw new PlayerError("Allow Factory Seat to use LMU's local interface first.");
+    }
+
+    /// <summary>Practice and qualifying for the next round, kept on the round and as the default for rounds without their own.</summary>
+    private object SetRoundSessions(JsonElement args)
+    {
+        var sessions = (JsonSerializer.Deserialize<LmuSessions>(args.GetProperty("sessions").GetRawText(), Json) ?? LmuSessions.Default).Normalized();
+        var view = Change(args, c =>
+        {
+            var round = StillRacing(c).CurrentSeason.NextRound ?? throw new PlayerError("There's no race to set up.");
+            if (round.State == RoundState.Armed) throw new PlayerError("Cancel the weekend before changing its sessions.");
+            round.LmuSessions = sessions;
+        });
+        _settings.LmuSessions = sessions;
+        _settings.Save();
+        return view;
+    }
+
+    /// <summary>
+    /// Reads which packs LMU says the player owns, in the background: an ownedPacks event brings
+    /// owned, notOwned and unsure pack ids, or a failed status with a phrase.
+    /// </summary>
+    private object DetectOwnedPacks()
+    {
+        RequireLmuConsent();
+        _ = Task.Run(async () =>
+        {
+            void Post(object message) => _window.Invoke(() => _window.PostEvent(JsonSerializer.Serialize(message, Json)));
+            try
+            {
+                using var cancel = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                using var game = new LmuGame();
+                if (await game.StateAsync(cancel.Token) is null)
+                    throw new PlayerError("LMU isn't running. Start it, go to its main menu, and try again.");
+                var tracks = await game.TracksAsync(cancel.Token);
+                var vehicles = await game.VehiclesAsync(cancel.Token);
+                var packs = LmuOwnership.Packs(_catalog, tracks, vehicles);
+                _window.Invoke(() => KeepVehicles(vehicles));
+                Post(new { @event = "ownedPacks", status = "done", packs.Owned, packs.NotOwned, packs.Unsure });
+            }
+            catch (PlayerError ex)
+            {
+                Post(new { @event = "ownedPacks", status = "failed", error = ex.Message, phrase = ex.Phrase });
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or LmuApiException)
+            {
+                Log($"LMU packs: {ex.Message}");
+                var phrase = Phrase.Of("LMU stopped answering. Check the game, then try again.");
+                Post(new { @event = "ownedPacks", status = "failed", error = phrase.ToString(), phrase });
+            }
+        });
+        return new { started = true };
+    }
+
     /// <summary>
     /// Sets the next race up in LMU through its local API and loads it, starting the race weekend
     /// just before the load. It takes a few seconds, so it runs in the background and reports to
@@ -773,7 +853,10 @@ public sealed class ApiHost
     {
         var career = StillRacing(Load(args));
         var round = career.CurrentSeason.NextRound ?? throw new PlayerError("There's no race to set up.");
+        RequireLmuConsent();
         if (_settingUpLmu) throw new PlayerError("Factory Seat is already setting a race up in LMU.");
+        // Only when the player confirmed replacing a session LMU still holds.
+        var replace = args.TryGetProperty("replace", out var r) && r.ValueKind == JsonValueKind.True;
 
         var briefing = BriefingFile.For(career, _catalog, Updates.CurrentLabel, DateTimeOffset.Now).Round
             ?? throw new PlayerError("There's no race to set up.");
@@ -786,26 +869,29 @@ public sealed class ApiHost
 
         _settingUpLmu = true;
         var id = career.Id;
-        var sessions = _settings.LmuSessions;
-        _ = Task.Run(() => RunLmuSetup(id, briefing, ev, car, sessions));
+        var sessions = round.LmuSessions ?? _settings.LmuSessions;
+        var load = _settings.LmuLoadWeekend;
+        _ = Task.Run(() => RunLmuSetup(id, briefing, ev, car, sessions, replace, load));
         return new { started = true };
     }
 
-    private async Task RunLmuSetup(Guid id, BriefingRound briefing, EventInfo? ev, CarInfo? car, LmuSessions sessions)
+    private async Task RunLmuSetup(Guid id, BriefingRound briefing, EventInfo? ev, CarInfo? car, LmuSessions sessions, bool replace, bool load)
     {
         void Post(string status, string? step = null, Phrase? error = null) =>
             _window.Invoke(() => _window.PostEvent(JsonSerializer.Serialize(
-                new { @event = "lmuSetup", careerId = id, status, step, error = error?.ToString(), phrase = error }, Json)));
+                new { @event = "lmuSetup", careerId = id, status, step, loaded = load, error = error?.ToString(), phrase = error }, Json)));
 
         using var cancel = new CancellationTokenSource(TimeSpan.FromMinutes(5));
         using var game = new LmuGame();
         try
         {
             Post("working", "connect");
-            var state = await game.StateAsync(cancel.Token)
-                ?? throw new PlayerError("LMU isn't running. Start it, go to its main menu, and try again.");
-            if (state.Navigation is not ("NAV_MAIN_MENU" or "NAV_SETUP"))
-                throw new PlayerError("LMU is in a session. Leave it, go to LMU's main menu, and try again.");
+            var state = await game.ReadinessAsync(cancel.Token);
+            if (state.Readiness == LmuReadiness.NotRunning)
+                throw new PlayerError("LMU isn't running. Start it, go to its main menu, and try again.");
+            if (state.Readiness == LmuReadiness.Busy)
+                throw new PlayerError("LMU is busy ({state}). Go to its offline Race Weekend menu, and try again.", ("state", state.Describe()));
+            if (state.Readiness == LmuReadiness.RetainedSession && !replace) throw new LmuRetainedSessionException();
 
             var vehicles = await game.VehiclesAsync(cancel.Token);
             _window.Invoke(() => KeepVehicles(vehicles));
@@ -813,8 +899,13 @@ public sealed class ApiHost
             var track = (await game.TracksAsync(cancel.Token)).FirstOrDefault(t => t.SceneDesc == plan.SceneDesc)
                 ?? throw new PlayerError("LMU's track list has no {layout}. Set this race up in LMU yourself.", ("layout", briefing.Track.LayoutName));
 
-            await game.SetUpAsync(plan, track, () => ArmFromLmu(id), step => Post("working", step), cancel.Token);
+            await game.SetUpAsync(plan, track, replace, load, () => ArmFromLmu(id), step => Post("working", step), cancel.Token);
             Post("done");
+        }
+        catch (LmuRetainedSessionException)
+        {
+            // Nothing was sent: the page asks the player before replacing it.
+            Post("confirm", error: Phrase.Of("LMU still holds a session. Setting this race up replaces it, and anything not saved in it is lost."));
         }
         catch (PlayerError ex)
         {
@@ -913,7 +1004,8 @@ public sealed class ApiHost
     /// </summary>
     private void RefreshLmuVehicles()
     {
-        if (_lmuVehiclesFresh || _lmuVehiclesAsking || DateTime.UtcNow - _lmuVehiclesAskedAt < TimeSpan.FromSeconds(10)) return;
+        // Not before the player allows it: until then the kept list (if any) is all there is.
+        if (!_lmuConsent || _lmuVehiclesFresh || _lmuVehiclesAsking || DateTime.UtcNow - _lmuVehiclesAskedAt < TimeSpan.FromSeconds(10)) return;
         _lmuVehiclesAsking = true;
         _lmuVehiclesAskedAt = DateTime.UtcNow;
         _ = Task.Run(async () =>

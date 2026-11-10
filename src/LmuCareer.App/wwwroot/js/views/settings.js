@@ -4,6 +4,7 @@ import { state, showModal, closeModal, go, attempt, catalog, toast } from "../ap
 import { applyTheme } from "../theme.js";
 import { configureSound, sound } from "../sound.js";
 import { t } from "../i18n.js";
+import { revokeLmuConsent } from "../lmuAccess.js";
 
 // Settings: language, theme, interface sounds, the LMU folder, the liveries you've built, and the about box.
 
@@ -37,6 +38,18 @@ export async function openSettings() {
     return h("select", { class: "input", style: { width: "260px" }, onchange: (e) => setLanguage(e.target.value) },
       h("option", { value: "auto", selected: choice === "auto" }, auto),
       locale.available.map((l) => h("option", { value: l.code, selected: choice === l.code }, l.name)));
+  }
+
+  /** Whether Factory Seat may use LMU's local interface this session, and a way to take it back. */
+  function lmuAccessRow() {
+    const value = h("span", { class: "faint" }, "…");
+    call("lmuConsent").then((status) => {
+      put(clear(value), status?.granted
+        ? h("button", { class: "btn ghost small", onclick: async () => { if (await revokeLmuConsent()) render(); } }, t("Take back"))
+        : h("span", { class: "faint" }, t("Not allowed")));
+    }).catch(() => {});
+    return setting(t("Local interface"), value,
+      { hint: t("Setting races up, DLC and liveries from LMU. Allowed until you close the app; taking it back can't undo what was already sent.") });
   }
 
   function render() {
@@ -100,7 +113,12 @@ export async function openSettings() {
       h("div", { class: "rows-title" }, "Le Mans Ultimate"),
       h("div", { class: "rows" },
         setting(t("Install folder"), h("button", { class: "btn ghost small", onclick: () => { closeModal(); go("#/setup"); } }, t("Change")),
-          { hint: state.lmu?.root ?? t("Not set") })),
+          { hint: state.lmu?.root ?? t("Not set") }),
+        lmuAccessRow(),
+        setting(t("Load the weekend too"), h("button", {
+          class: "toggle" + (s.lmuLoadWeekend ? " on" : ""), "data-sound": "none",
+          onclick: () => save({ lmuLoadWeekend: !s.lmuLoadWeekend }),
+        }), { hint: t("On: Set it up in LMU for me also loads the weekend. Off: it leaves everything set on LMU's menu, for you to check on LMU's race settings screen and start there.") })),
 
       h("div", { class: "rows-title" }, t("My sponsor liveries")),
       h("div", { class: "faint", style: { fontSize: "12px", marginBottom: "6px" } },

@@ -47,6 +47,12 @@ public sealed class AppSettings
     /// <summary>Practice and qualifying for races Factory Seat sets up in LMU.</summary>
     public LmuSessions LmuSessions { get; set; } = LmuSessions.Default;
 
+    /// <summary>
+    /// After setting a race up in LMU, load the weekend too. Off: leave it set on LMU's menu, for the
+    /// player to check on LMU's own settings screen and start from there.
+    /// </summary>
+    public bool LmuLoadWeekend { get; set; }
+
     /// <summary>Brands the player added themselves, for liveries of their own design.</summary>
     public List<OwnSponsor> CustomSponsors { get; set; } = [];
 

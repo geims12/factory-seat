@@ -1,5 +1,7 @@
 import { h } from "../dom.js";
 import { t, mark } from "../i18n.js";
+import { toast } from "../app.js";
+import { detectOwnedPacks } from "../lmuAccess.js";
 
 // The DLC checklist: which packs the player owns. Used when starting a career and to change a
 // career's packs later (bought one since, or ticked one by mistake).
@@ -28,9 +30,26 @@ export function packChecklist(cat, owned, onChange) {
       h("div", { class: "value" }, h("button", { class: "toggle" + (owned.includes(id) ? " on" : ""), "data-sound": "none", tabindex: "-1" })));
   };
 
+  // LMU's own ownership flags: packs it lists as wholly owned get ticked, wholly not owned untick,
+  // and anything in between (or not listed) stays as the player set it.
+  const detect = async (button) => {
+    button.disabled = true;
+    const found = await detectOwnedPacks();
+    button.disabled = false;
+    if (!found) return;
+    const next = [...new Set([...owned.filter((id) => !found.notOwned.includes(id)), ...found.owned.filter((id) => ALL.includes(id))])];
+    const unsure = found.unsure.filter((id) => ALL.includes(id)).map((id) => cat.packs.find((p) => p.id === id)?.name ?? id);
+    toast(unsure.length
+      ? t("LMU says you own {n} packs. Check these yourself: {packs}.", { n: found.owned.length, packs: unsure.join(", ") })
+      : t("LMU says you own {n} packs.", { n: found.owned.length }));
+    onChange(next);
+  };
+
   return [
     h("div", { class: "row" },
       h("button", { class: "btn ghost small", onclick: () => onChange(allOwned ? [] : [...ALL]) }, allOwned ? t("Clear all") : t("I own everything")),
+      h("button", { class: "btn ghost small", title: t("Reads which packs you own from LMU, with the game open on its main menu"),
+        onclick: (e) => detect(e.currentTarget) }, t("Read from LMU")),
       h("span", { class: "faint" }, t("A Race Control Pro+ subscription unlocks every pack."))),
     h("div", { class: "rows-title" }, t("Base game"), h("span", { class: "faint", style: { fontSize: "16px" } }, t("Always included"))),
     h("div", { class: "rows" },

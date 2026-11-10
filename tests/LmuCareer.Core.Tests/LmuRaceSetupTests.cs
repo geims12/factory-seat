@@ -305,5 +305,78 @@ public sealed class LmuRaceSetupTests
         Assert.Null(LmuCarImages.FrontAngle(root, "../../Settings"));
         Assert.Null(LmuCarImages.FrontAngle(root, "21_26_AFCO31910023"));
     }
+
+    [Fact]
+    public void Sessions_can_be_private_and_start_when_the_player_says()
+    {
+        var preset = Preset();
+        var sessions = new LmuSessions(45, 1, 15, 1) { PracticePrivate = false, QualifyingPrivate = true, PracticeStart = 600, QualifyingStart = 840 };
+        LmuRaceSetup.ApplyTo(preset, LmuRaceSetup.Plan(Round(), Event("world"), Catalog.Car("Ferrari_296GT3_2023"), Vehicles, sessions));
+        var conditions = preset["Player"]!["Race Conditions"]!;
+        Assert.False(conditions["PrivatePractice"]!.GetValue<bool>());
+        Assert.Equal(600, conditions["Practice1StartingTime"]!.GetValue<int>());
+        Assert.Equal(1, conditions["PrivateQualifying"]!.GetValue<int>());
+        Assert.Equal(840, conditions["QualifyingStartingTime"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public void A_session_left_out_keeps_LMUs_own_privacy_and_start()
+    {
+        var preset = Preset();
+        var before = preset["Player"]!["Race Conditions"]!["Practice1StartingTime"]!.GetValue<int>();
+        LmuRaceSetup.ApplyTo(preset, LmuRaceSetup.Plan(Round(), Event("world"), Catalog.Car("Ferrari_296GT3_2023"), Vehicles,
+            new LmuSessions(0, 0, 20, 1) { PracticeStart = 900 }));
+        Assert.Equal(before, preset["Player"]!["Race Conditions"]!["Practice1StartingTime"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public void Start_times_snap_to_the_half_hour_and_default_stays_default()
+    {
+        var snapped = new LmuSessions(30, 0, 20, 1) { PracticeStart = 611, QualifyingStart = 5000 }.Normalized();
+        Assert.Equal(600, snapped.PracticeStart);
+        Assert.Equal(-1, snapped.QualifyingStart);
+        Assert.Equal(-1, LmuSessions.Default.Normalized().PracticeStart);
+    }
+
+    private static IReadOnlyList<LmuTrack> TracksOwned(Func<string, bool> owned) =>
+        Tracks.Select(t => t with { Owned = owned(t.Folder) }).ToList();
+
+    private static IReadOnlyList<LmuVehicle> CarsOwned(Func<string, bool> owned) =>
+        Vehicles.Select(v => v with { Owned = owned(v.Folder) }).ToList();
+
+    [Fact]
+    public void Everything_owned_means_every_pack()
+    {
+        var packs = LmuOwnership.Packs(Catalog, TracksOwned(_ => true), CarsOwned(_ => true));
+        Assert.Empty(packs.NotOwned);
+        Assert.Contains("2024-1", packs.Owned);
+        Assert.DoesNotContain(ContentCatalog.BasePack, packs.Owned);
+    }
+
+    [Fact]
+    public void A_pack_LMU_locks_is_not_owned()
+    {
+        var pack = Catalog.Packs.First(p => p.Id != ContentCatalog.BasePack
+            && Catalog.Tracks.Any(t => t.Pack == p.Id) && Catalog.Cars.Any(c => c.Pack == p.Id));
+        var tracks = Catalog.Tracks.Where(t => t.Pack == pack.Id).Select(t => t.Folder).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var cars = Catalog.Cars.Where(c => c.Pack == pack.Id).Select(c => c.Folder).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var none = LmuOwnership.Packs(Catalog, TracksOwned(f => !tracks.Contains(f)), CarsOwned(f => !cars.Contains(f)));
+        Assert.Contains(pack.Id, none.NotOwned);
+        Assert.DoesNotContain(pack.Id, none.Owned);
+
+        // Only its track locked: partly owned, so the player decides.
+        var part = LmuOwnership.Packs(Catalog, TracksOwned(f => !tracks.Contains(f)), CarsOwned(_ => true));
+        Assert.Contains(pack.Id, part.Unsure);
+    }
+
+    [Fact]
+    public void A_pack_LMU_doesnt_list_is_left_to_the_player()
+    {
+        var packs = LmuOwnership.Packs(Catalog, TracksOwned(_ => true), CarsOwned(_ => true).Where(v => v.Folder != "Ferrari_296GT3_2023").ToList());
+        var ferrariPack = Catalog.Car("Ferrari_296GT3_2023")!.Pack!;
+        Assert.Contains(ferrariPack, packs.Unsure);
+        Assert.Throws<PlayerError>(() => LmuOwnership.Packs(Catalog, [], Vehicles));
+    }
 }
 

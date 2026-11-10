@@ -11,6 +11,7 @@ import { RACE_LENGTHS } from "./seasonBuilder.js";
 import { careerGuide } from "./guide.js";
 import { achievementList, achievementCount, achievementTile, popUnlocks } from "../achievements.js";
 import { openRecapCard } from "../recapCard.js";
+import { ensureLmuConsent } from "../lmuAccess.js";
 import { t, tn, lmu, mark, number, dateTime, capitalize, midSentence, countryName, currentLanguage } from "../i18n.js";
 
 let stopListening = null;
@@ -367,8 +368,8 @@ export async function careerView(view, id, tab) {
           h("div", { class: "rows", style: { marginBottom: "16px" } }, round.guest ? guestCarRow(round, tick("car")) : carRow(car, tick("car"), !isArmed)),
           h("div", { class: "lmu-path" }, lmu("Event settings")),
           h("div", { class: "rows" },
-            sessionRow("practice", isArmed),
-            sessionRow("qualifying", isArmed),
+            sessionRow("practice", isArmed, round),
+            sessionRow("qualifying", isArmed, round),
             setting(lmu("Race length"), [formatMinutes(round.raceMinutes), isArmed ? null
               : h("button", { class: "btn ghost small", style: { marginLeft: "10px" }, onclick: () => changeLength(round) }, t("Change"))],
               { big: true, tick: tick("length") }),
@@ -627,48 +628,76 @@ export async function careerView(view, id, tab) {
         },
       }, picture, h("div", { class: "livery-name" }, `#${e.number}`), h("div", { class: "faint" }, e.team));
     });
+    const fetchLiveries = async () => {
+      closeModal();
+      if (!(await ensureLmuConsent())) return;
+      toast(t("Reading LMU's car list…"));
+      // Asks LMU in the background; the briefing redraws when the list comes in.
+      call("carChoices", { id }).catch(() => {});
+    };
     showModal([
       h("h2", {}, t("Pick your car")),
-      h("p", { class: "muted" }, pictures
-        ? t("The livery each car runs in this race, as LMU shows it.")
-        : t("Open LMU once with Factory Seat running to see each car's livery here.")),
+      pictures
+        ? h("p", { class: "muted" }, t("The livery each car runs in this race, as LMU shows it."))
+        : h("div", { class: "row", style: { gap: "12px", alignItems: "center" } },
+          h("p", { class: "muted", style: { margin: 0 } }, t("With LMU open on its main menu, Factory Seat can show each car's livery here.")),
+          h("button", { class: "btn ghost small", onclick: fetchLiveries }, t("Get liveries from LMU"))),
       h("div", { class: "livery-grid" }, cards),
       h("div", { class: "modal-actions" }, h("button", { class: "btn ghost", "data-sound": "back", onclick: closeModal }, t("Cancel"))),
     ], { wide: true });
   }
 
   /**
-   * Practice or qualifying for the weekend: off or a length, and the session's time scale (how
-   * fast the track rubbers in). Picked here for Set it up in LMU for me, and kept for every race.
+   * Practice or qualifying for the weekend: off or a length, open or private, a start time, and
+   * the session's time scale (how fast the track rubbers in). Kept on this round for Set it up in
+   * LMU for me; the latest choice is also the default for rounds not set yet.
    */
-  function sessionRow(kind, isArmed) {
+  function sessionRow(kind, isArmed, round) {
     const practice = kind === "practice";
-    const sessions = { practiceMinutes: 30, practiceTimeScale: 0, qualifyingMinutes: 20, qualifyingTimeScale: 1, ...(state.settings.lmuSessions ?? {}) };
-    const minutesKey = practice ? "practiceMinutes" : "qualifyingMinutes";
-    const scaleKey = practice ? "practiceTimeScale" : "qualifyingTimeScale";
+    const sessions = {
+      practiceMinutes: 30, practiceTimeScale: 0, qualifyingMinutes: 20, qualifyingTimeScale: 1,
+      practicePrivate: true, qualifyingPrivate: false, practiceStart: -1, qualifyingStart: -1,
+      ...(state.settings.lmuSessions ?? {}), ...(round.lmuSessions ?? {}),
+    };
+    const key = (name) => (practice ? "practice" : "qualifying") + name;
     const lengths = practice ? [10, 15, 20, 30, 45, 60, 90, 120, 180] : [10, 15, 20, 30, 45, 60];
     const scales = [[0, lmu("Static")], [1, lmu("Normal")], [2, "2x"], [3, "3x"], [5, "5x"]];
-    const minutes = sessions[minutesKey];
+    const starts = [-1, ...Array.from({ length: 31 }, (_, i) => 360 + i * 30)];
+    const clock = (m) => (m < 0 ? lmu("Default") : `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`);
+    const minutes = sessions[key("Minutes")];
     const save = async (change) => {
-      const next = await attempt(call("setPrefs", { lmuSessions: { ...sessions, ...change } }));
-      if (next) { state.settings = next; show("briefing"); }
+      const next = { ...sessions, ...change };
+      if (await attempt(call("setRoundSessions", { id, sessions: next }))) {
+        state.settings.lmuSessions = next;
+        show("briefing");
+      }
     };
     const hint = practice
       ? t("After you start the weekend, your engineer reads practice for pace.")
       : t("Without qualifying, LMU starts you from the back of the grid.");
     const label = practice ? lmu("Practice") : lmu("Qualifying");
+    const privacy = (on) => (on ? t("Private") : t("Open"));
     if (isArmed) {
-      const scale = scales.find(([v]) => v === sessions[scaleKey])?.[1] ?? "";
-      return setting(label, minutes > 0 ? `${formatMinutes(minutes)} · ${scale}` : t("Off"), { hint, untickable: true });
+      const scale = scales.find(([v]) => v === sessions[key("TimeScale")])?.[1] ?? "";
+      return setting(label, minutes > 0
+        ? [formatMinutes(minutes), privacy(sessions[key("Private")]), clock(sessions[key("Start")]), scale].join(" · ")
+        : t("Off"), { hint, untickable: true });
     }
-    const length = h("select", { class: "input", style: { width: "130px" }, onchange: (e) => save({ [minutesKey]: Number(e.target.value) }) },
-      h("option", { value: "0", selected: minutes === 0 }, t("Off")),
-      lengths.map((m) => h("option", { value: String(m), selected: m === minutes }, formatMinutes(m))));
-    const scale = minutes > 0
-      ? h("select", { class: "input", style: { width: "120px" }, title: t("Time scale: how fast the track rubbers in"), onchange: (e) => save({ [scaleKey]: Number(e.target.value) }) },
-        scales.map(([v, text]) => h("option", { value: String(v), selected: v === sessions[scaleKey] }, text)))
-      : null;
-    return setting(label, h("span", { class: "row", style: { gap: "8px", justifyContent: "flex-end" } }, length, scale), { hint, untickable: true });
+    const select = (title, width, options, current, onPick) => h("select", { class: "input", title, style: { width },
+      onchange: (e) => onPick(e.target.value) },
+    options.map(([value, text]) => h("option", { value: String(value), selected: value === current }, text)));
+    const controls = [
+      select(t("Length"), "120px", [[0, t("Off")], ...lengths.map((m) => [m, formatMinutes(m)])], minutes,
+        (v) => save({ [key("Minutes")]: Number(v) })),
+      minutes > 0 ? select(t("Open or private: private puts you alone on track"), "110px", [[false, t("Open")], [true, t("Private")]],
+        sessions[key("Private")], (v) => save({ [key("Private")]: v === "true" })) : null,
+      minutes > 0 ? select(t("Start time"), "110px", starts.map((m) => [m, clock(m)]), sessions[key("Start")],
+        (v) => save({ [key("Start")]: Number(v) })) : null,
+      minutes > 0 ? select(t("Time scale: how fast the track rubbers in"), "110px", scales, sessions[key("TimeScale")],
+        (v) => save({ [key("TimeScale")]: Number(v) })) : null,
+    ];
+    return setting(label, h("span", { class: "row", style: { gap: "8px", justifyContent: "flex-end", flexWrap: "wrap" } }, controls),
+      { hint, untickable: true });
   }
 
   /** A guest drive is in the guest team's car, not the season's. */
@@ -828,30 +857,58 @@ export async function careerView(view, id, tab) {
 
   /**
    * Sets the race up in LMU through the game's own local API and loads the weekend: the same
-   * settings as the rows below, without the clicking. LMU has to be open, on its main menu.
+   * settings as the rows below, without the clicking. LMU has to be open, on its main menu. The
+   * first time each run of the app, the player allows it (lmuAccess.js); setting it up by hand
+   * never needs it.
    */
   function lmuSetupPanel(round, items, ticks, key) {
-    const line = h("div", { class: "faint" }, t("LMU open on its main menu? Factory Seat can set all of this up and load the weekend for you."));
+    const idle = state.settings?.lmuLoadWeekend
+      ? t("LMU open on its main menu? Factory Seat can set all of this up and load the weekend for you.")
+      : t("LMU open on its main menu? Factory Seat can set all of this up for you to check in LMU and start.");
+    const line = h("div", { class: "faint" }, idle);
     const button = h("button", { class: "btn small", "data-sound": "confirm" }, t("Set it up in LMU for me"));
-    button.onclick = async () => {
+    const confirmArea = h("div");
+    const ui = { line, button, ticks, items, key, confirmArea, idle };
+    ui.start = async (replace) => {
+      if (!(await ensureLmuConsent())) return;
+      clear(confirmArea);
       button.disabled = true;
       line.textContent = t("Talking to LMU…");
-      lmuSetupLine = { line, button, ticks, items, key };
-      const started = await attempt(call("setUpInLmu", { id }));
-      if (!started) {
+      lmuSetupLine = ui;
+      if (!(await attempt(call("setUpInLmu", { id, replace })))) {
         button.disabled = false;
-        line.textContent = t("LMU open on its main menu? Factory Seat can set all of this up and load the weekend for you.");
+        line.textContent = idle;
         lmuSetupLine = null;
       }
     };
+    button.onclick = () => ui.start(false);
     return h("div", { class: "notice info", style: { marginBottom: "16px" } },
-      h("div", { class: "row", style: { alignItems: "center", gap: "12px" } }, line, h("div", { class: "spacer" }), button));
+      h("div", { class: "row", style: { alignItems: "center", gap: "12px" } }, line, h("div", { class: "spacer" }), button),
+      confirmArea);
   }
 
-  /** An lmuSetup event: a step done, the weekend loaded, or what went wrong. */
+  /**
+   * LMU still holds a session (it can, even with its home screen showing). Nothing was sent; the
+   * player replaces it only by ticking the box and pressing the button.
+   */
+  function retainedSessionPrompt(ui, message) {
+    const replace = h("button", { class: "btn small", disabled: true, "data-sound": "confirm", onclick: () => ui.start(true) },
+      t("Replace it and set up"));
+    const box = h("input", { type: "checkbox", onchange: () => { replace.disabled = !box.checked; } });
+    put(clear(ui.confirmArea),
+      h("div", { class: "notice", style: { marginTop: "12px" } },
+        h("div", {}, message.phrase ? t(message.phrase) : message.error),
+        h("label", { class: "row", style: { gap: "8px", margin: "8px 0", alignItems: "flex-start" } }, box,
+          h("span", {}, t("Replace the session LMU holds. Save anything in it you want to keep first."))),
+        h("div", { class: "row", style: { gap: "8px" } },
+          h("button", { class: "btn ghost small", onclick: () => clear(ui.confirmArea) }, t("Keep it")), replace)));
+  }
+
+  /** An lmuSetup event: a step done, the weekend loaded, a session to confirm replacing, or what went wrong. */
   function lmuSetupProgress(message) {
     const steps = {
       connect: t("Talking to LMU…"),
+      release: t("Closing LMU's earlier session…"),
       track: t("Setting the track…"),
       car: t("Picking your car…"),
       settings: t("Setting the race up…"),
@@ -864,18 +921,24 @@ export async function careerView(view, id, tab) {
       return;
     }
     lmuSetupLine = null;
+    if (ui) {
+      ui.button.disabled = false;
+      ui.line.textContent = ui.idle;
+    }
+    if (message.status === "confirm") {
+      if (ui) retainedSessionPrompt(ui, message);
+      return;
+    }
     if (message.status === "done") {
       if (ui) { for (const item of ui.items) ui.ticks.add(item); saveTicks(ui.key, ui.ticks); }
       sound.confirm();
-      toast(t("The weekend is loaded in LMU, and it's started here. Go race."));
+      toast(message.loaded
+        ? t("The weekend is loaded in LMU, and it's started here. Go race.")
+        : t("It's all set in LMU, and the weekend's started here. In LMU, open Single Player and go on to the race settings to check it, then start the weekend there."));
       if (tab === "briefing") show("briefing");
       return;
     }
     toast(message.phrase ? t(message.phrase) : message.error, { error: true });
-    if (ui) {
-      ui.button.disabled = false;
-      ui.line.textContent = t("LMU open on its main menu? Factory Seat can set all of this up and load the weekend for you.");
-    }
     // The weekend may have started before the load went wrong.
     if (tab === "briefing") show("briefing");
   }

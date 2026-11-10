@@ -98,6 +98,9 @@ public sealed class Round
     /// <summary>New Game+: the AI Strength, weather and damage this round must be raced at. Null otherwise.</summary>
     public RoundFloor? Floor { get; set; }
 
+    /// <summary>Practice and qualifying for this round when Factory Seat sets it up in LMU; null for the app's defaults.</summary>
+    public Content.LmuSessions? LmuSessions { get; set; }
+
     /// <summary>New Game+: LMU's AI settings as Settings.JSON had them when the weekend started.</summary>
     public Content.AiSettingsSeen? AiAtStart { get; set; }
 }

@@ -96,7 +96,8 @@ this call as their "is LMU running" check.
 
 ### `POST /navigation/action/NAV_TO_MAIN_MENU`
 
-No body. Sends the UI back to the main menu. Always called after `returnToMonitor`,
+Body: JSON `null` (`Content-Type: application/json`), as LMU's own menu sends it; with no body
+at all the call didn't answer. Sends the UI back to the main menu and ends a loaded offline session. Always called after `returnToMonitor`,
 never alone from inside a session (see Exit).
 
 ## Catalog
@@ -380,6 +381,9 @@ has proved it yet.
 | Damage | `Player["Game Options"]["Damage Multiplier"]` | Percent (`100`) | Seen |
 | AI field | `Grid` | Array of vehicle `id`s from `getAllVehicles`. `Grid[0]` is the player's car | Confirmed |
 | Sessions | `Player["Race Conditions"]["Run Practice1"]`..`["Run Practice4"]`, `["Run Warmup"]`, `["Num Qual Sessions"]`, `["Num Race Sessions"]` | Bools / counts | Seen |
+| Practice / qualifying length | `Player["Game Options"]["practice length"]`, `["qualifying length"]` | Minutes (LMU's event info listed PRACTICE 180, QUALIFYING 60) | Confirmed |
+| Practice / qualifying privacy | `Player["Race Conditions"].PrivatePractice` (bool), `.PrivateQualifying` (0 open, 1 private) | | Seen (also used by thebaz's branch) |
+| Practice / qualifying start | `Player["Race Conditions"].Practice1StartingTime`, `.QualifyingStartingTime` | Minutes from midnight; `-1` = track default | Seen (thebaz's branch) |
 | Weather | `Weather.<Practice\|Qualifying\|Race>.Weather[0..4]` | See [Weather slots](#weather-slots) | Confirmed |
 | AI Strength | Not in the preset | See [Settings (options)](#settings-options) | Confirmed |
 
@@ -483,6 +487,48 @@ a loaded race will run with.
 
 `POST /rest/sessions/settings` with `{"sessionSetting": <name>, "value": <step value>}` is
 how the menu changes one of them. Not needed when sending a whole preset; not tested.
+
+## Is LMU ready? Menu, retained session, busy
+
+From [thebaz's windows-weekend branch](https://github.com/thebaz/factory-seat/tree/contribution/windows-weekend)
+(tested there on build 14200), now used by Factory Seat's setup:
+
+- **Offline menu:** `/navigation/state` has `navigationState` `NAV_MAIN_MENU` (or `NAV_SETUP`),
+  `gameState` `GSTATE_SETUP`, `settingMode` `SETTING_GRANDPRIX`, and `loadingStatus.loading` false.
+- **Retained session:** after a session LMU can keep reporting `NAV_EVENT` / `GSTATE_DYN` with
+  its home screen showing. `GET /rest/sessions/GetGameState` then says whether that session sits in
+  the monitor: `inMonitor` true, `isReplayActive` false, `playerVehicleLoaded` true. Setting a race
+  up then replaces it, so the player confirms first. The app then ends it with `NAV_TO_MAIN_MENU`
+  and waits for the offline menu before setting anything. Loading straight over a retained session
+  works in the game, but LMU's screen stays on its home page with the weekend loaded behind it
+  (tested on build 14200).
+- **Moving LMU's screen:** the menu changes screens itself. When a load starts, the game sends it
+  `NavigateToLoadingView` (the main menu layout listens), and the loading screen moves to the
+  weekend (`/event/menu/summary`) on `NavigateToEventView`. The navigation actions
+  `NAV_FOCUS_EVENT`, `NAV_TO_EVENT_MONITOR` and `NAV_BACK_TO_EVENT` answer 200 but didn't move a
+  home screen stuck over a loaded weekend. So the load has to start from the offline menu.
+- **Anything else** (driving: `NAV_REALTIME`; a replay; loading; multiplayer) is busy: set nothing.
+
+Readiness is checked before setting up and again right before `loadGame`.
+
+## Other reads used
+
+- `GET /rest/garage/UIScreen/SessionSetup`: `trackInfo` (with `sceneDesc`, `isOwned`) and
+  `selectedCar` (with `id`): the track and car LMU's session screen holds. A second check after the
+  preset's own (from thebaz's branch).
+- `generateSaveFileFromSessionPreset`'s `SessionPreset` is checked again for track, car, length,
+  fuel, tyres, Time Scale and grid before `loadGame`.
+- **DLC ownership:** `isOwned` on every `getTracksAll` and `getAllVehicles` entry, with the pack's
+  Steam `dlcAppID`. LMU's menu uses it to lock what the player doesn't own ("You don't own the
+  track", disabled Car / Event settings steps, `getMissingDlcAppId` for the store page).
+  `GET /rest/profile/DLC/viewDLC` doesn't list anything: the menu calls it
+  `viewDLCInSteamOverlayUrl` (it opens a DLC's store page in the Steam overlay).
+- **Custom team cars:** `POST /rest/sessions/getAllAvailableVehicles` with the body `"LiveryEditor"`
+  lists them, tagged `Default_Custom_Livery` (91 on build 14200, one per model, season and series,
+  e.g. `397_26_AMG`). `SetCurrentVehicle` takes `{ id, paintBlobID, teamName, vehicleNumber }` for
+  one. The player's own liveries (the `paintBlobID`s) are only listed by Studio 397's online service
+  (`RaceOS`, `api/v1/team/livery/player`, signed in), which Factory Seat doesn't call; Settings.JSON's
+  `CUSTOMLIVERY` holds the last one used.
 
 ## Tested end to end: a race built from the API
 
